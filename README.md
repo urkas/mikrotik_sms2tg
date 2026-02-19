@@ -56,17 +56,16 @@ WinBox → **System → Scripts → sms2tg → Source**
 Найди блок настроек и поменяй значения:
 
 ```routeros
-:local smsNum "+7 (000) 000-00-00";
-:local resetFromList "+79990000000,+79990000001";
+:local smsNum "PUT_MODEM_PHONE_NUM_HERE";
+:local resetFromList "PUT_YOUR_PHONE_NUM_HERE";
 :local tgToken "PUT_TELEGRAM_BOT_TOKEN_HERE";
 :local tgChatId "PUT_TELEGRAM_CHAT_ID_HERE";
 :local smsPort "lte1";
 ```
-
 ### Что означает
 
-- `smsNum` — “номер устройства” для шапки в Telegram (косметика)
-- `resetFromList` — номера, которым разрешено прислать `RESET`
+- `smsNum` — “номер устройства” для шапки в Telegram (косметика) например "+7 (000) 000-00-00"
+- `resetFromList` — номера, которым разрешено прислать `RESET`, например "+79990000000,+79990000001"
 - `tgToken` — токен Telegram‑бота
 - `tgChatId` — chat_id (канал/группа/чат)
 - `smsPort` — порт модема (например `lte1`)
@@ -80,14 +79,6 @@ WinBox → **System → Scripts → sms2tg → Source**
 ```routeros
 /system script run sms2tg
 ```
-
-Логи:
-
-```routeros
-/log print where message~"sms2tg:"
-```
-
----
 
 ## Включение Scheduler
 
