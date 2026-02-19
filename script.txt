@@ -1,0 +1,423 @@
+# =========================
+# sms2tg: SMS -> Telegram (concat glue) + ARCHIVE to /file/SMS
+# Deletes SMS from modem inbox after archiving
+# =========================
+
+:local P "sms2tg:";
+
+:do {
+
+# === Settings ===
+:local smsNum "<PHONE_NUM>"; # Номер телефона в модеме
+:local resetFromList "<RESET_NUMS>"; # Номера телефонов СМС с текстом RESET с которых перезгрузит устройство, можно через запятую указать несколько
+:local tgToken "<TGBOT_TOKEN>"; # Token Бота в телеграм
+:local tgChatId "<CHAT_ID>"; # Чат для отправки СМС.
+:local smsPort "lte1";
+:local apiUrl ("https://api.telegram.org/bot" . $tgToken . "/sendMessage");
+
+:local mtName [/system identity get name];
+:if ([:len $mtName] = 0) do={ :set mtName "MikroTik"; }
+
+# --- enable sms ---
+/tool sms set port=$smsPort receive-enabled=yes;
+
+# --- ensure folder SMS ---
+:do { /file make-directory name="SMS"; } on-error={
+    :do { /file add name="SMS" type=directory; } on-error={}
+};
+
+:local nowDate [/system clock get date];
+:local nowTime [/system clock get time];
+
+# ===== helpers =====
+:local hex2dec do={ :return [:tonum ("0x" . $1)]; };
+
+:local onlyHex do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :local hexd "0123456789abcdefABCDEF";
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if ([:typeof [:find $hexd $c]] != "nil") do={ :set out ($out . $c); }
+        :set i ($i + 1);
+    }
+    :return $out;
+};
+
+:local digitsOnly do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :local dig "0123456789";
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if ([:typeof [:find $dig $c]] != "nil") do={ :set out ($out . $c); }
+        :set i ($i + 1);
+    }
+    :return $out;
+};
+
+:local safeName do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :local ok "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if (($c=" ") || ($c="/") || ($c=":") || ($c=".") ) do={
+            :set out ($out . "_");
+        } else={
+            :if ([:typeof [:find $ok $c]] != "nil") do={ :set out ($out . $c); }
+        }
+        :set i ($i + 1);
+    }
+    :return $out;
+};
+
+:local jsonSafe do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if ($c="\\") do={ :set out ($out . "\\u005C"); } else={
+        :if ($c="\"") do={ :set out ($out . "\\u0022"); } else={
+        :if ($c="\r") do={ :set out ($out . "\\u000D"); } else={
+        :if ($c="\n") do={ :set out ($out . "\\u000A"); } else={
+        :if ($c="\t") do={ :set out ($out . "\\u0009"); } else={
+            :set out ($out . $c);
+        }}}}};
+        :set i ($i + 1);
+    }
+    :return $out;
+};
+
+:local fileSafe do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if ($c="\r") do={ :set out ($out . "\\r"); } else={
+        :if ($c="\n") do={ :set out ($out . "\\n"); } else={
+            :set out ($out . $c);
+        }};
+        :set i ($i + 1);
+    }
+    :return $out;
+};
+
+:local unFileSafe do={
+    :local s $1; :local out ""; :local i 0; :local n [:len $s];
+    :while ($i < $n) do={
+        :local c [:pick $s $i ($i+1)];
+        :if (($c="\\") && (($i+1) < $n)) do={
+            :local c2 [:pick $s ($i+1) ($i+2)];
+            :if ($c2="n") do={ :set out ($out . "\n"); :set i ($i + 2); } else={
+            :if ($c2="r") do={ :set out ($out . "\r"); :set i ($i + 2); } else={
+                :set out ($out . $c);
+                :set i ($i + 1);
+            }};
+        } else={
+            :set out ($out . $c);
+            :set i ($i + 1);
+        }
+    }
+    :return $out;
+};
+
+:local ucs2ToEsc do={
+    :local hex $1; :local out ""; :local i 0; :local n [:len $hex];
+    :while (($i + 4) <= $n) do={
+        :set out ($out . "\\u" . [:pick $hex $i ($i+4)]);
+        :set i ($i + 4);
+    }
+    :return $out;
+};
+
+:local getKV do={
+    :local data ($1 . "\n");
+    :local key ($2 . "=");
+    :local p [:find $data $key];
+    :if ([:typeof $p] = "nil") do={ :return ""; }
+    :local s ($p + [:len $key]);
+    :local e [:find $data "\n" $s];
+    :return [:pick $data $s $e];
+};
+
+:local setKV do={
+    :local content $1; :local k $2; :local v $3;
+    :local probe ($content . "\n");
+    :local key ($k . "=");
+    :local p [:find $probe $key];
+
+    :if ([:typeof $p] = "nil") do={
+        :if ([:len $content] = 0) do={ :return ($k . "=" . $v); }
+        :return ($content . "\n" . $k . "=" . $v);
+    }
+
+    :local lineEnd [:find $probe "\n" $p];
+    :local before [:pick $probe 0 $p];
+
+    :local afterStart ($lineEnd + 1);
+    :local after [:pick $probe $afterStart [:len $probe]];
+
+    :local out ($before . $k . "=" . $v);
+    :if ([:len $after] > 0) do={ :set out ($out . "\n" . $after); }
+
+    :local outLen [:len $out];
+    :if ($outLen > 0) do={
+        :local lastChar [:pick $out ($outLen-1) $outLen];
+        :if ($lastChar = "\n") do={ :set out [:pick $out 0 ($outLen-1)]; }
+    }
+
+    :return $out;
+};
+
+:local tgSend do={
+    :local url $1;
+    :local chatId $2;
+    :local textEsc $3;
+
+    :local json ("{\"chat_id\":\"" . $chatId . "\",\"text\":\"" . $textEsc . "\"}");
+
+    :do {
+        /tool fetch mode=https url=$url http-method=post http-header-field="Content-Type: application/json" http-data=$json check-certificate=no keep-result=no;
+        :return true;
+    } on-error={
+        :log error ($P . " fetch error: " . $message);
+        :return false;
+    };
+};
+
+:local writeFile do={
+    :local fname $1;
+    :local body  $2;
+    :local f [/file find where name=$fname];
+    :if ([:len $f] = 0) do={ /file add name=$fname; :set f [/file find where name=$fname]; }
+    /file set $f contents=$body;
+};
+
+# ===== 1) inbox -> buffer / single =====
+:foreach id in=[/tool sms inbox find] do={
+
+    :local from [/tool sms inbox get $id phone];
+    :local ts   [/tool sms inbox get $id timestamp];
+    :local msg0 [/tool sms inbox get $id message];
+    :local pdu0 [/tool sms inbox get $id pdu];
+    :local pdu  [$onlyHex $pdu0];
+
+    :local dcsHex "";
+    :local udHex  "";
+    :local msgEsc "";
+    :local fo 0;
+
+    :local isConcat false;
+    :local cref "";
+    :local ctot 1;
+    :local cseq 1;
+
+    :local doResetPart false;
+
+    :do {
+        :local p 0;
+
+        :local smscLen [$hex2dec [:pick $pdu 0 2]];
+        :local pduLen [:len $pdu];
+        :local smscSkip (($smscLen + 1) * 2);
+        :if (($smscLen <= 20) && ($smscSkip <= $pduLen)) do={ :set p $smscSkip; }
+
+        :set fo [$hex2dec [:pick $pdu $p ($p+2)]];
+        :set p ($p + 2);
+
+        :local oaLen [$hex2dec [:pick $pdu $p ($p+2)]];
+        :set p ($p + 2);
+
+        :set p ($p + 2); # type-of-address
+        :local oaOctets (($oaLen + 1) / 2);
+        :set p ($p + ($oaOctets * 2));
+
+        :set p ($p + 2); # PID
+        :set dcsHex [:pick $pdu $p ($p+2)];
+        :set p ($p + 2);
+
+        :set p ($p + 14); # SCTS
+
+        :local udl [$hex2dec [:pick $pdu $p ($p+2)]];
+        :set p ($p + 2);
+
+        :local udEnd ($p + ($udl * 2));
+        :if ($udEnd > $pduLen) do={ :set udEnd $pduLen; }
+        :set udHex [:pick $pdu $p $udEnd];
+
+        :local udHexLen [:len $udHex];
+
+        # UDH concat
+        :if ((($fo % 128) >= 64) && ($udHexLen >= 2)) do={
+            :local udhLen [$hex2dec [:pick $udHex 0 2]];
+            :local cut (($udhLen + 1) * 2);
+            :if ($cut > $udHexLen) do={ :set cut $udHexLen; }
+
+            :local udhAll [:pick $udHex 0 $cut];
+
+            :local p0 [:find $udhAll "0003"];
+            :if ([:typeof $p0] != "nil") do={
+                :set cref [:pick $udhAll ($p0+4) ($p0+6)];
+                :set ctot [$hex2dec [:pick $udhAll ($p0+6) ($p0+8)]];
+                :set cseq [$hex2dec [:pick $udhAll ($p0+8) ($p0+10)]];
+                :if ($ctot > 1) do={ :set isConcat true; }
+            } else={
+                :local p8 [:find $udhAll "0804"];
+                :if ([:typeof $p8] != "nil") do={
+                    :set cref [:pick $udhAll ($p8+4) ($p8+8)];
+                    :set ctot [$hex2dec [:pick $udhAll ($p8+8) ($p8+10)]];
+                    :set cseq [$hex2dec [:pick $udhAll ($p8+10) ($p8+12)]];
+                    :if ($ctot > 1) do={ :set isConcat true; }
+                }
+            }
+
+            :set udHex [:pick $udHex $cut [:len $udHex]];
+        }
+
+        # decode / RESET detect
+        :if (($dcsHex = "08") && ([:len $udHex] > 0)) do={
+            :set msgEsc [$ucs2ToEsc $udHex];
+            :if ([:typeof [:find $udHex "00520045005300450054"]] != "nil") do={ :set doResetPart true; }
+        } else={
+            :set msgEsc [$jsonSafe $msg0];
+            :if ([:typeof [:find $msg0 "RESET"]] != "nil") do={ :set doResetPart true; }
+        }
+
+    } on-error={
+        :set isConcat false;
+        :set cref "";
+        :set ctot 1;
+        :set cseq 1;
+        :set msgEsc [$jsonSafe $msg0];
+    };
+
+    # RESET allowed?
+    :local resetAllowed false;
+    :if ([:typeof [:find ("," . $resetFromList . ",") ("," . $from . ",")]] != "nil") do={ :set resetAllowed true; }
+
+    # --- multipart: buffer into /file/SMS and delete part from modem ---
+    :if ($isConcat && ([:len $cref] > 0) && ($ctot > 1) && ($cseq >= 1) && ($cseq <= $ctot)) do={
+
+        :local fromDigits [$digitsOnly $from];
+        :local bufName ("SMS/smsbufc_" . $fromDigits . "_" . $cref . ".txt");
+
+        :local fId [/file find where name=$bufName];
+        :if ([:len $fId] = 0) do={ /file add name=$bufName; :set fId [/file find where name=$bufName]; }
+
+        :local cont [/file get $fId contents];
+
+        :if ([:len [$getKV $cont "FROMRAW"]] = 0) do={ :set cont [$setKV $cont "FROMRAW" [$fileSafe $from]]; }
+        :if ([:len [$getKV $cont "FROMD"]] = 0)   do={ :set cont [$setKV $cont "FROMD" $fromDigits]; }
+        :if ([:len [$getKV $cont "CREF"]] = 0)    do={ :set cont [$setKV $cont "CREF" $cref]; }
+        :if ([:len [$getKV $cont "TS"]] = 0)      do={ :set cont [$setKV $cont "TS" [$fileSafe $ts]]; }
+        :if ([:len [$getKV $cont "TOTAL"]] = 0)   do={ :set cont [$setKV $cont "TOTAL" $ctot]; }
+
+        :if ($doResetPart && $resetAllowed) do={ :set cont [$setKV $cont "RESET" "1"]; }
+
+        :local kE ("P" . $cseq . "E");
+        :local kP ("P" . $cseq . "P");
+
+        :if ([:len [$getKV $cont $kE]] = 0) do={ :set cont ($cont . "\n" . $kE . "=" . $msgEsc); }
+        :if ([:len [$getKV $cont $kP]] = 0) do={ :set cont ($cont . "\n" . $kP . "=" . [$fileSafe $msg0]); }
+
+        /file set $fId contents=$cont;
+
+        # delete SMS-part from modem memory
+        :do { /tool sms inbox remove $id; } on-error={};
+
+    } else={
+
+        # --- single: archive -> delete from modem -> send TG ---
+        :local fn ("SMS/sms_" . [$safeName $nowDate] . "_" . [$safeName $nowTime] . "_from" . [$digitsOnly $from] . "_id" . $id . ".txt");
+        :local arch ("MikroTik: " . $mtName . "\nPhone: " . $smsNum . "\nFrom: " . $from . "\nTime: " . $ts . "\n\n" . $msg0);
+        [$writeFile $fn $arch];
+
+        :do { /tool sms inbox remove $id; } on-error={};
+
+        :local textEsc ("MikroTik: " . [$jsonSafe $mtName] . "\\u000APhone: " . [$jsonSafe $smsNum] . "\\u000ASMS\\u000AFrom: " . [$jsonSafe $from] . "\\u000ATime: " . [$jsonSafe $ts] . "\\u000A\\u000A" . $msgEsc);
+
+        :if (![$tgSend $apiUrl $tgChatId $textEsc]) do={
+            :log error ($P . " send failed single (archived) id=" . $id);
+        }
+
+        :if ($doResetPart && $resetAllowed) do={ :delay 3; /system reboot; }
+    }
+}
+
+# ===== 2) send completed buffers (do not delete buffers inside loop) =====
+:local delFiles "";
+:local needReboot false;
+
+:foreach fid in=[/file find where name~"SMS/smsbufc_"] do={
+
+    :local cont [/file get $fid contents];
+    :local totalStr [$getKV $cont "TOTAL"];
+    :if ([:len $totalStr] = 0) do={ :continue; }
+
+    :local total [:tonum $totalStr];
+    :local complete true;
+
+    :for i from=1 to=$total do={
+        :local kE ("P" . $i . "E");
+        :if ([:len [$getKV $cont $kE]] = 0) do={ :set complete false; }
+    }
+
+    :if ($complete) do={
+
+        :local fromRaw [$unFileSafe [$getKV $cont "FROMRAW"]];
+        :local fromDigits [$getKV $cont "FROMD"];
+        :local cref [$getKV $cont "CREF"];
+        :local tsBuf  [$unFileSafe [$getKV $cont "TS"]];
+        :local resetBuf [$getKV $cont "RESET"];
+
+        :local fullEsc "";
+        :local fullPlain "";
+
+        :for i from=1 to=$total do={
+            :local kE2 ("P" . $i . "E");
+            :local kP2 ("P" . $i . "P");
+            :set fullEsc ($fullEsc . [$getKV $cont $kE2]);
+            :set fullPlain ($fullPlain . [$unFileSafe [$getKV $cont $kP2]]);
+        }
+
+        :local textEsc ("MikroTik: " . [$jsonSafe $mtName] . "\\u000APhone: " . [$jsonSafe $smsNum] . "\\u000ASMS\\u000AFrom: " . [$jsonSafe $fromRaw] . "\\u000ATime: " . [$jsonSafe $tsBuf] . "\\u000A\\u000A" . $fullEsc);
+
+        :local ok [$tgSend $apiUrl $tgChatId $textEsc];
+
+        :if ($ok) do={
+
+            :local fn2 ("SMS/sms_" . [$safeName $nowDate] . "_" . [$safeName $nowTime] . "_from" . $fromDigits . "_ref" . $cref . ".txt");
+            :local arch2 ("MikroTik: " . $mtName . "\nPhone: " . $smsNum . "\nFrom: " . $fromRaw . "\nTime: " . $tsBuf . "\n\n" . $fullPlain);
+            [$writeFile $fn2 $arch2];
+
+            :local fname [/file get $fid name];
+            :if ([:len $delFiles] = 0) do={ :set delFiles $fname; } else={ :set delFiles ($delFiles . "," . $fname); }
+
+            :if ($resetBuf="1") do={ :set needReboot true; }
+
+        } else={
+            :log error ($P . " send failed multipart (buffer kept) file=" . [/file get $fid name]);
+        }
+    }
+}
+
+# ===== delete buffers after loop =====
+:if ([:len $delFiles] > 0) do={
+    :local s ($delFiles . ",");
+    :local p 0;
+    :local sl [:len $s];
+    :while ($p < $sl) do={
+        :local c [:find $s "," $p];
+        :if ([:typeof $c] = "nil") do={ :set c $sl; }
+        :local nm [:pick $s $p $c];
+        :if ([:len $nm] > 0) do={ :do { /file remove [find where name=$nm]; } on-error={}; }
+        :set p ($c + 1);
+    }
+}
+
+:if ($needReboot) do={ :delay 3; /system reboot; }
+
+
+
+} on-error={
+    :local em $message;
+    :if ([:typeof $em] = "nil") do={ :set em ""; }
+    :if ([:len $em] = 0) do={ :set em "unknown"; }
+    :log error ($P . " FATAL: " . $em);
+}
