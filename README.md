@@ -1,4 +1,4 @@
-# sms2tg (RouterOS 7.x) — SMS → Telegram + склейка длинных SMS + архив в /SMS
+# sms2tg (RouterOS 7.x) — Cyrillic SMS → Telegram + склейка длинных SMS + архив в /SMS
 
 Скрипт для MikroTik RouterOS 7.x, который:
 - Понимает SMS на русском. Никаких ??????????? ??????? ?????.
