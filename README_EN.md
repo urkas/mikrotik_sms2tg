@@ -1,4 +1,4 @@
-# sms2tg (RouterOS 7.x) — SMS → Telegram + multipart SMS concatenation + /SMS archive
+# sms2tg (RouterOS 7.x) — Cyrillic SMS → Telegram + multipart SMS concatenation + /SMS archive
 
 A MikroTik RouterOS 7.x script that:
 - reads incoming SMS from `/tool sms inbox`
